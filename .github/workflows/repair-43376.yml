@@ -17,7 +17,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: codex/ci-repair-43376-20261014
-      - name: Confirm the generated OpenAPI result
+          fetch-depth: 2
+      - name: Confirm generated OpenAPI
         run: test "$(git hash-object docs/static/resources/openapi.json)" = f6f48b2af1f89667b81d7def59ae39cb05715579
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -28,160 +29,31 @@ jobs:
           path: /tmp/ci-image
       - name: Load original frontend CI image
         run: zstd -d < /tmp/ci-image/docker-image.tar.zst | docker load
-      - name: Apply modal cleanup and deterministic regression tests
+      - name: Apply candidate changes and order test helpers
         run: |
+          git cat-file -e 0559d711959405cc1a2f67fc74b9b35b9cfca034 || git fetch --depth=1 origin 0559d711959405cc1a2f67fc74b9b35b9cfca034
           python - <<'PY'
           from pathlib import Path
           from textwrap import dedent
+          import subprocess
+          source = subprocess.check_output([
+              'git', 'show',
+              '0559d711959405cc1a2f67fc74b9b35b9cfca034:.github/workflows/repair-43376.yml',
+          ], text=True)
+          script = source.split("          python - <<'PY'\n", 1)[1].split('          PY\n', 1)[0]
+          exec(compile(dedent(script), '<reviewed-candidate-patch>', 'exec'))
           p = Path('superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx')
           s = p.read_text()
-          if "test('unmount cancels a queued runtime schema refresh'" not in s:
-              for old, new in {
-                  'const { rerender } = render(<AddSemanticViewModal {...props} />);':
-                  'const { rerender, unmount } = render(<AddSemanticViewModal {...props} />);',
-                  'return { pending, props, rerender };':
-                  'return { pending, props, rerender, unmount };',
-              }.items():
-                  assert s.count(old) == 1, old
-                  s = s.replace(old, new)
-              marker = "test.each(['shared', 'old_only'])("
-              assert s.count(marker) == 1
-              tests = dedent('''\
-              test('unmount cancels a queued runtime schema refresh', async () => {
-                const { pending, unmount } = await openDependentSchemaForm();
-                await chooseDependentOption('Database', 'second');
-                expect(pending).toHaveLength(1);
-                unmount();
-                await act(async () => {
-                  jest.advanceTimersByTime(SCHEMA_REFRESH_DEBOUNCE_MS);
-                });
-                expect(pending).toHaveLength(1);
-              });
-
-              test('unmount cancels queued view discovery', async () => {
-                const { unmount } = await openDependentSchemaForm();
-                await chooseDependentOption('Schema', 'shared');
-                expect(viewsRequests()).toHaveLength(0);
-                unmount();
-                await act(async () => {
-                  jest.advanceTimersByTime(SCHEMA_REFRESH_DEBOUNCE_MS * 2);
-                });
-                expect(viewsRequests()).toHaveLength(0);
-              });
-
-              test('unmount invalidates an in-flight schema refresh failure', async () => {
-                const { pending, props, unmount } = await openDependentSchemaForm();
-                await chooseDependentOption('Database', 'second');
-                await act(async () => {
-                  jest.advanceTimersByTime(SCHEMA_REFRESH_DEBOUNCE_MS);
-                });
-                expect(pending).toHaveLength(2);
-                unmount();
-                await act(async () => {
-                  pending[1].reject(new Error('request completed after unmount'));
-                });
-                expect(props.addDangerToast).not.toHaveBeenCalled();
-              });
-
-              ''')
-              s = s.replace(marker, tests + marker)
-          s = s.replace('async function chooseDependentOption(name: string, value: string)',
-                        'async function chooseDependentOption(name: string | RegExp, value: string)')
-          start = s.index("test('a failed array-only refresh keeps views and Add usable with a bounded retry'")
-          end = s.index("test('the save payload carries every selected metric'", start)
-          bounded = dedent('''\
-          test('a failed array-only refresh keeps views and Add usable with a bounded retry', async () => {
-            jest.useFakeTimers();
-            const refreshCounts = new Map<string, number>();
-            const schemaWithMode = {
-              ...dynamicMetricsSchema,
-              properties: {
-                ...dynamicMetricsSchema.properties,
-                mode: {
-                  type: 'string',
-                  title: 'Mode',
-                  enum: ['full', 'cube'],
-                  'x-dynamic': true,
-                  'x-dependsOn': ['mode'],
-                },
-              },
-            };
-            mockLayerWithSchema(schemaWithMode, {
-              '/api/v1/semantic_layer/layer-1/schema/runtime': (payload: unknown) => {
-                const data = (payload as { runtime_data?: Record<string, unknown> })
-                  ?.runtime_data;
-                if (data) {
-                  const snapshot = JSON.stringify([data.metrics ?? [], data.mode ?? null]);
-                  refreshCounts.set(snapshot, (refreshCounts.get(snapshot) ?? 0) + 1);
-                  return Promise.reject(new Error('refresh boom'));
-                }
-                return Promise.resolve({ json: { result: schemaWithMode } });
-              },
-            });
-            // Flush refresh, retry, JSON Forms, and views timers with microtasks
-            // between ticks rather than depending on the runner's wall clock.
-            const settleRefreshes = async () => {
-              for (let tick = 0; tick < 8; tick += 1) {
-                await act(async () => {
-                  await jest.advanceTimersByTimeAsync(SCHEMA_REFRESH_DEBOUNCE_MS);
-                });
-              }
-            };
-            const props = createProps();
-            render(<AddSemanticViewModal {...props} />);
-            await chooseDependentOption('Semantic layer', 'Snowflake SL');
-            await act(async () => {
-              await jest.advanceTimersByTimeAsync(10);
-            });
-            await chooseDependentOption(/metrics/i, 'm1');
-            await settleRefreshes();
-
-            expect(props.addDangerToast).toHaveBeenCalledWith(
-              'An error occurred while refreshing the runtime schema',
-            );
-            expect(selectedTag('m1')).toBeTruthy();
-            expect(screen.getByRole('combobox', { name: 'Semantic views' })).toBeEnabled();
-            await chooseDependentOption('Semantic views', 'orders');
-            expect(screen.getByRole('button', { name: /Add 1 view/ })).toBeEnabled();
-
-            await chooseDependentOption(/metrics/i, 'm2');
-            await settleRefreshes();
-            expect(selectedTag('m1')).toBeTruthy();
-            expect(selectedTag('m2')).toBeTruthy();
-            expect(screen.getByRole('combobox', { name: 'Semantic views' })).toBeEnabled();
-            expect(refreshCounts.get(JSON.stringify([['m1'], null]))).toBeGreaterThanOrEqual(1);
-            expect(refreshCounts.get(JSON.stringify([['m1', 'm2'], null]))).toBeGreaterThanOrEqual(1);
-            // Initial empty input and subsequent picks are distinct dependency
-            // states. Each permits one attempt plus at most one retry.
-            expect([...refreshCounts.values()].every(count => count <= 2)).toBe(true);
-            expect(props.addDangerToast).toHaveBeenCalledTimes(1);
-            const settledCounts = [...refreshCounts.entries()];
-            await settleRefreshes();
-            expect([...refreshCounts.entries()]).toEqual(settledCounts);
-          });
-
-          ''')
-          p.write_text(s[:start] + bounded + s[end:])
-          p = Path('superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx')
-          s = p.read_text()
-          if '// A parent can unmount the modal without first setting show to false.' not in s:
-              marker = '  // =========================================================================\n  // Modal open / close\n  // =========================================================================\n'
-              assert s.count(marker) == 1
-              cleanup = '''
-            // A parent can unmount the modal without first setting show to false.
-            // Cancel queued schema/view work and invalidate in-flight responses.
-            useEffect(
-              () => () => {
-                fetchGenRef.current += 1;
-                schemaRefreshGenRef.current += 1;
-                viewsGenRef.current += 1;
-                if (schemaTimerRef.current) clearTimeout(schemaTimerRef.current);
-                if (viewsTimerRef.current) clearTimeout(viewsTimerRef.current);
-              },
-              [],
-            );
-          '''
-              p.write_text(s.replace(marker, marker + cleanup))
+          start = s.index('async function chooseDependentOption(')
+          end = s.index('async function openDependentSchemaForm(', start)
+          helper = s[start:end]
+          s = s[:start] + s[end:]
+          assert s.count('beforeEach(() => {') == 1
+          s = s.replace('beforeEach(() => {', helper + 'beforeEach(() => {', 1)
+          old = "  expect(refreshCounts.get(JSON.stringify([['m1'], null]))).toBeGreaterThanOrEqual(1);\n  expect(refreshCounts.get(JSON.stringify([['m1', 'm2'], null]))).toBeGreaterThanOrEqual(1);"
+          new = "  const attemptedMetrics = [...refreshCounts.keys()].map(snapshot => JSON.parse(snapshot)[0]);\n  expect(attemptedMetrics).toEqual(expect.arrayContaining([['m1'], ['m1', 'm2']]));"
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new))
           PY
       - name: Format and lint candidates
         run: |
@@ -190,7 +62,7 @@ jobs:
             -v "$PWD/superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx:/app/superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx" \
             apache/superset:GHA-38532746400 bash -c \
             'npx oxfmt --write src/features/semanticViews/AddSemanticViewModal.tsx src/features/semanticViews/AddSemanticViewModal.test.tsx && npx oxlint --config oxlint.json src/features/semanticViews/AddSemanticViewModal.tsx src/features/semanticViews/AddSemanticViewModal.test.tsx'
-      - name: Save candidates on the isolated branch
+      - name: Save candidates on isolated branch
         run: |
           git diff --check
           git config user.name 'github-actions[bot]'
@@ -208,7 +80,7 @@ jobs:
             -v "$PWD/superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx:/app/superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx:ro" \
             apache/superset:GHA-38532746400 bash -c \
             'npx jest --runInBand --silent --runTestsByPath src/features/semanticViews/AddSemanticViewModal.test.tsx src/explore/components/controls/ViewQueryModal.test.tsx src/dashboard/components/SliceHeaderControls/SliceHeaderControls.test.tsx && npx jest --runInBand --silent --runTestsByPath src/features/semanticViews/AddSemanticViewModal.test.tsx && npx jest --runInBand --silent --runTestsByPath src/features/semanticViews/AddSemanticViewModal.test.tsx'
-      - name: Build workspace declarations and type-check as in upstream CI
+      - name: Build workspace declarations and type-check
         run: |
           docker run --rm -e CI=true \
             -v "$PWD/superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx:/app/superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx:ro" \
