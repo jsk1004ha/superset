@@ -18,7 +18,7 @@ jobs:
         with:
           ref: codex/ci-repair-43376-20261014
       - name: Confirm the previously generated OpenAPI result
-        run: test "$(git hash-object docs/static/resources/openapi.json)" = f6f48b217c6f0414c6aaead1b7d4cf95fd0f2a418
+        run: test "$(git hash-object docs/static/resources/openapi.json)" = f6f48b2af1f89667b81d7def59ae39cb05715579
       - name: Download the exact frontend CI image
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
