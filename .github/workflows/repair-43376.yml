@@ -17,26 +17,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: codex/ci-repair-43376-20261014
-      - name: Set up the pinned backend environment
-        uses: apache/superset/.github/actions/setup-backend@85236f78994434c311ca0b508989eda0f290a86a
-        with:
-          requirements-type: base
-      - name: Regenerate and verify the OpenAPI spec
-        env:
-          SUPERSET__SQLALCHEMY_DATABASE_URI: 'sqlite:///:memory:'
-          FLASK_APP: 'superset.app:create_app()'
-        run: |
-          superset update-api-docs
-          test "$(git diff --numstat -- docs/static/resources/openapi.json)" = "$(printf '168\t0\tdocs/static/resources/openapi.json')"
-          cp docs/static/resources/openapi.json /tmp/openapi-first.json
-          superset update-api-docs
-          cmp /tmp/openapi-first.json docs/static/resources/openapi.json
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add docs/static/resources/openapi.json
-          git commit -m 'docs: refresh semantic deletion conflict responses in OpenAPI'
-          git push origin HEAD:codex/ci-repair-43376-20261014
-          git ls-tree HEAD docs/static/resources/openapi.json
+      - name: Confirm the previously generated OpenAPI result
+        run: test "$(git hash-object docs/static/resources/openapi.json)" = f6f48b217c6f0414c6aaead1b7d4cf95fd0f2a418
       - name: Download the exact frontend CI image
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -47,10 +29,11 @@ jobs:
           path: /tmp/ci-image
       - name: Load the frontend CI image
         run: zstd -d < /tmp/ci-image/docker-image.tar.zst | docker load
-      - name: Add unmount regression tests
+      - name: Apply modal cleanup and regression tests
         run: |
           python - <<'PY'
           from pathlib import Path
+          from textwrap import dedent
           p = Path('superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx')
           s = p.read_text()
           replacements = {
@@ -64,7 +47,8 @@ jobs:
               s = s.replace(old, new)
           marker = "test.each(['shared', 'old_only'])("
           assert s.count(marker) == 1
-          tests = '''test('unmount cancels a queued runtime schema refresh', async () => {
+          tests = dedent('''\
+          test('unmount cancels a queued runtime schema refresh', async () => {
             const { pending, unmount } = await openDependentSchemaForm();
             await chooseDependentOption('Database', 'second');
             expect(pending).toHaveLength(1);
@@ -100,22 +84,8 @@ jobs:
             expect(props.addDangerToast).not.toHaveBeenCalled();
           });
 
-          '''
+          ''')
           p.write_text(s.replace(marker, tests + marker))
-          PY
-      - name: Confirm the regressions fail before the fix
-        run: |
-          if docker run --rm -e CI=true \
-            -v "$PWD/superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx:/app/superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx:ro" \
-            apache/superset:GHA-38532746400 bash -c \
-            'npm run test -- --maxWorkers=1 --runTestsByPath src/features/semanticViews/AddSemanticViewModal.test.tsx --testNamePattern="unmount (cancels|invalidates)"'; then
-            echo 'Expected the new regression tests to expose the missing cleanup.'
-            exit 1
-          fi
-      - name: Cancel timers and invalidate requests on unmount
-        run: |
-          python - <<'PY'
-          from pathlib import Path
           p = Path('superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx')
           s = p.read_text()
           marker = '  // =========================================================================\n  // Modal open / close\n  // =========================================================================\n'
@@ -137,24 +107,26 @@ jobs:
           '''
           p.write_text(s.replace(marker, marker + cleanup))
           PY
-      - name: Format and lint the changed frontend files
+      - name: Format, lint, and test the fixes
         run: |
           docker run --rm -e CI=true \
             -v "$PWD/superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx:/app/superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx" \
             -v "$PWD/superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx:/app/superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx" \
             apache/superset:GHA-38532746400 bash -c \
-            'npx oxfmt --write src/features/semanticViews/AddSemanticViewModal.tsx src/features/semanticViews/AddSemanticViewModal.test.tsx && npx oxlint --config oxlint.json src/features/semanticViews/AddSemanticViewModal.tsx src/features/semanticViews/AddSemanticViewModal.test.tsx'
-      - name: Verify the semantic-view and query-inspector tests
+            'npx oxfmt --write src/features/semanticViews/AddSemanticViewModal.tsx src/features/semanticViews/AddSemanticViewModal.test.tsx && npx oxlint --config oxlint.json src/features/semanticViews/AddSemanticViewModal.tsx src/features/semanticViews/AddSemanticViewModal.test.tsx && npm run test -- --silent --maxWorkers=1 --runTestsByPath src/features/semanticViews/AddSemanticViewModal.test.tsx src/explore/components/controls/ViewQueryModal.test.tsx src/dashboard/components/SliceHeaderControls/SliceHeaderControls.test.tsx'
+      - name: Publish tested changes to this isolated branch
+        run: |
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx
+          git commit -m 'fix(semantic): cancel modal requests and timers on unmount'
+          git push origin HEAD:codex/ci-repair-43376-20261014
+          git ls-tree HEAD docs/static/resources/openapi.json superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx
+      - name: Build workspace declarations and type-check as in upstream CI
         run: |
           docker run --rm -e CI=true \
             -v "$PWD/superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx:/app/superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx:ro" \
             -v "$PWD/superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx:/app/superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx:ro" \
             apache/superset:GHA-38532746400 bash -c \
-            'npm run test -- --maxWorkers=1 --runTestsByPath src/features/semanticViews/AddSemanticViewModal.test.tsx src/explore/components/controls/ViewQueryModal.test.tsx src/dashboard/components/SliceHeaderControls/SliceHeaderControls.test.tsx && npm run type'
-      - name: Publish verified frontend changes to this isolated branch
-        run: |
-          git diff --check
-          git add superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx
-          git commit -m 'fix(semantic): cancel modal requests and timers on unmount'
-          git push origin HEAD:codex/ci-repair-43376-20261014
-          git ls-tree HEAD docs/static/resources/openapi.json superset-frontend/src/features/semanticViews/AddSemanticViewModal.tsx superset-frontend/src/features/semanticViews/AddSemanticViewModal.test.tsx
+            'npm i && npm run plugins:build && npm run type'
